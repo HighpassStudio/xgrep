@@ -149,8 +149,13 @@ xgrep "TODO" src/**/*.rs
 ## Install
 
 ```bash
+cargo install xgrep-cli
+
+# Or from source
 cargo install --path .
 ```
+
+The crate is published as `xgrep-cli` but the binary is `xgrep`.
 
 ## How the index works
 

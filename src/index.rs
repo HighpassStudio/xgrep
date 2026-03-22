@@ -304,31 +304,29 @@ pub fn consolidated_search(
     let needs_context = args.has_context();
     let count_only = (args.count || args.files_with_matches || args.quiet) && !needs_context;
 
+    // Line-oriented iteration across the full data buffer.
+    // A line's block is determined by where it STARTS (pos / BLOCK_SIZE).
+    // Lines that span block boundaries are read fully — the newline search
+    // extends across the entire data slice, not just the current block.
+
     if count_only {
         let mut count = 0usize;
+        let mut pos = 0usize;
 
-        for block_idx in 0..block_count {
-            if !candidate_set[block_idx] {
-                continue;
-            }
+        while pos < data.len() {
+            let line_end = memchr::memchr(b'\n', &data[pos..])
+                .map(|i| pos + i)
+                .unwrap_or(data.len());
 
-            let block_start = block_idx * BLOCK_SIZE;
-            let block_end = std::cmp::min(block_start + BLOCK_SIZE, data.len());
-            let block_data = &data[block_start..block_end];
-
-            let mut pos = 0;
-            while pos < block_data.len() {
-                let line_end = memchr::memchr(b'\n', &block_data[pos..])
-                    .map(|i| pos + i)
-                    .unwrap_or(block_data.len());
-
-                let line_end_trim = if line_end > pos && block_data[line_end - 1] == b'\r' {
+            let block_idx = pos / BLOCK_SIZE;
+            if block_idx < block_count && candidate_set[block_idx] {
+                let line_end_trim = if line_end > pos && data[line_end - 1] == b'\r' {
                     line_end - 1
                 } else {
                     line_end
                 };
 
-                let line = String::from_utf8_lossy(&block_data[pos..line_end_trim]);
+                let line = String::from_utf8_lossy(&data[pos..line_end_trim]);
                 let matched = if let Some(jf) = json_filters.as_ref() {
                     crate::query::line_matches_filters(&line, jf)
                 } else {
@@ -340,12 +338,9 @@ pub fn consolidated_search(
                         break;
                     }
                 }
-                pos = line_end + 1;
             }
 
-            if count >= max_count || (args.quiet && count > 0) {
-                break;
-            }
+            pos = line_end + 1;
         }
 
         let dummy_matches: Vec<Match> = (0..count)
@@ -371,7 +366,7 @@ pub fn consolidated_search(
         ));
     }
 
-    // Full output path
+    // Full output path — line-oriented across full data
     let before = args.before_context;
     let after = args.after_context;
     let mut matches: Vec<Match> = Vec::new();
@@ -379,96 +374,78 @@ pub fn consolidated_search(
     let mut line_num = 0usize;
     let mut before_buf: Vec<(usize, String)> = Vec::with_capacity(before + 1);
     let mut after_remaining = 0usize;
+    let mut pos = 0usize;
 
-    for block_idx in 0..block_count {
-        let block_start = block_idx * BLOCK_SIZE;
-        let block_end = std::cmp::min(block_start + BLOCK_SIZE, data.len());
-        let block_data = &data[block_start..block_end];
+    while pos < data.len() && matches.len() < max_count {
+        let line_end = memchr::memchr(b'\n', &data[pos..])
+            .map(|i| pos + i)
+            .unwrap_or(data.len());
 
-        if !candidate_set[block_idx] && after_remaining == 0 && !needs_context {
-            let newline_count = memchr::memchr_iter(b'\n', block_data).count();
-            line_num += newline_count;
-            if !block_data.is_empty() && block_data[block_data.len() - 1] != b'\n' {
-                line_num += 1;
-            }
-            continue;
-        }
+        line_num += 1;
 
-        let mut pos = 0;
-        while pos < block_data.len() {
-            let line_end = memchr::memchr(b'\n', &block_data[pos..])
-                .map(|i| pos + i)
-                .unwrap_or(block_data.len());
+        let block_idx = pos / BLOCK_SIZE;
+        let in_candidate = block_idx < block_count && candidate_set[block_idx];
 
-            line_num += 1;
+        let line_end_trim = if line_end > pos && data[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
 
-            let line_end_trim = if line_end > pos && block_data[line_end - 1] == b'\r' {
-                line_end - 1
-            } else {
-                line_end
-            };
-
-            if candidate_set[block_idx] {
-                let line_str = String::from_utf8_lossy(&block_data[pos..line_end_trim]);
-                let match_result = if let Some(jf) = json_filters.as_ref() {
-                    if crate::query::line_matches_filters(&line_str, jf) {
-                        Some((0, line_str.len()))
-                    } else {
-                        None
-                    }
+        if in_candidate {
+            let line_str = String::from_utf8_lossy(&data[pos..line_end_trim]);
+            let match_result = if let Some(jf) = json_filters.as_ref() {
+                if crate::query::line_matches_filters(&line_str, jf) {
+                    Some((0, line_str.len()))
                 } else {
-                    matcher.find_in_line(&line_str)
-                };
-                if let Some((start, end)) = match_result {
-                    if matches.len() >= max_count {
-                        break;
-                    }
-                    if needs_context {
-                        for ctx in before_buf.drain(..) {
-                            context_lines.push(ctx);
-                        }
-                    }
-                    matches.push(Match {
-                        line_number: line_num,
-                        line: line_str.into_owned(),
-                        match_start: start,
-                        match_end: end,
-                    });
-                    after_remaining = after;
-                } else if needs_context {
-                    if after_remaining > 0 {
-                        context_lines.push((line_num, line_str.into_owned()));
-                        after_remaining -= 1;
-                    } else if before > 0 {
-                        if before_buf.len() >= before {
-                            before_buf.remove(0);
-                        }
-                        before_buf.push((line_num, line_str.into_owned()));
+                    None
+                }
+            } else {
+                matcher.find_in_line(&line_str)
+            };
+            if let Some((start, end)) = match_result {
+                if needs_context {
+                    for ctx in before_buf.drain(..) {
+                        context_lines.push(ctx);
                     }
                 }
+                matches.push(Match {
+                    line_number: line_num,
+                    line: line_str.into_owned(),
+                    match_start: start,
+                    match_end: end,
+                });
+                after_remaining = after;
             } else if needs_context {
                 if after_remaining > 0 {
-                    let line_str = String::from_utf8_lossy(&block_data[pos..line_end_trim]);
                     context_lines.push((line_num, line_str.into_owned()));
                     after_remaining -= 1;
                 } else if before > 0 {
-                    let line_str = String::from_utf8_lossy(&block_data[pos..line_end_trim]);
                     if before_buf.len() >= before {
                         before_buf.remove(0);
                     }
                     before_buf.push((line_num, line_str.into_owned()));
                 }
             }
-
-            if args.quiet && !matches.is_empty() {
-                break;
+        } else if needs_context {
+            if after_remaining > 0 {
+                let line_str = String::from_utf8_lossy(&data[pos..line_end_trim]);
+                context_lines.push((line_num, line_str.into_owned()));
+                after_remaining -= 1;
+            } else if before > 0 {
+                let line_str = String::from_utf8_lossy(&data[pos..line_end_trim]);
+                if before_buf.len() >= before {
+                    before_buf.remove(0);
+                }
+                before_buf.push((line_num, line_str.into_owned()));
             }
-            pos = line_end + 1;
         }
 
-        if matches.len() >= max_count {
+        if args.quiet && !matches.is_empty() {
             break;
         }
+
+        pos = line_end + 1;
     }
 
     Some((

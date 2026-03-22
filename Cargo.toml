@@ -1,11 +1,14 @@
 [package]
-name = "xgrep"
+name = "xgrep-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Fast grep for compressed and archived data. Parallel search across .gz, .log, and text files."
+description = "Indexed search accelerator for compressed logs. Cached queries 100-1200x faster than zgrep."
 license = "Apache-2.0"
-keywords = ["grep", "search", "compression", "parallel", "logs"]
+repository = "https://github.com/HighpassStudio/xgrep"
+homepage = "https://github.com/HighpassStudio/xgrep"
+keywords = ["grep", "search", "compression", "logs", "bloom-filter"]
 categories = ["command-line-utilities", "compression"]
+readme = "README.md"
 
 [[bin]]
 name = "xgrep"

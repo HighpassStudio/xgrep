@@ -427,7 +427,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xgrep"
+name = "xgrep-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
