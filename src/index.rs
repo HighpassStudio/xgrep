@@ -31,6 +31,7 @@ use crate::block::BlockSearchStats;
 use crate::cli::Args;
 use crate::discover::FileEntry;
 use crate::matcher::{Match, Matcher};
+use crate::query::JsonFilter;
 use crate::search::SearchResult;
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -59,7 +60,7 @@ pub struct ConsolidatedIndex {
 }
 
 /// Build consolidated index for a set of files in a directory.
-pub fn build_consolidated_index(files: &[FileEntry]) -> Result<()> {
+pub fn build_consolidated_index(files: &[FileEntry], json_mode: bool) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -72,13 +73,13 @@ pub fn build_consolidated_index(files: &[FileEntry]) -> Result<()> {
     }
 
     for (dir, dir_files) in &by_dir {
-        build_index_for_dir(dir, dir_files)?;
+        build_index_for_dir(dir, dir_files, json_mode)?;
     }
 
     Ok(())
 }
 
-fn build_index_for_dir(dir: &Path, files: &[&FileEntry]) -> Result<()> {
+fn build_index_for_dir(dir: &Path, files: &[&FileEntry], json_mode: bool) -> Result<()> {
     let cache_dir = dir.join(".xgrep");
     fs::create_dir_all(&cache_dir)?;
 
@@ -133,7 +134,11 @@ fn build_index_for_dir(dir: &Path, files: &[&FileEntry]) -> Result<()> {
         for block_idx in 0..num_blocks {
             let start = block_idx * BLOCK_SIZE;
             let end = std::cmp::min(start + BLOCK_SIZE, data.len());
-            let bloom_filter = bloom::build_block_bloom(&data[start..end]);
+            let bloom_filter = if json_mode {
+                bloom::build_block_bloom_json(&data[start..end])
+            } else {
+                bloom::build_block_bloom(&data[start..end])
+            };
             let bits = bloom_filter.as_bytes();
             index_buf.extend_from_slice(bits);
             if bits.len() < BLOOM_SIZE {
@@ -240,6 +245,7 @@ pub fn consolidated_search(
     matcher: &Matcher,
     args: &Args,
     literals: &Option<Vec<u8>>,
+    json_filters: &Option<Vec<JsonFilter>>,
 ) -> Option<(SearchResult, BlockSearchStats)> {
     let filename = file.path.file_name()?.to_string_lossy().to_string();
     let entry = idx.files.get(&filename)?;
@@ -273,7 +279,16 @@ pub fn consolidated_search(
     let mut candidate_set = vec![false; block_count];
     let mut skipped = 0usize;
 
-    if let Some(lit) = literals.as_deref() {
+    if let Some(jf) = json_filters.as_ref() {
+        // JSON mode: use field-value bloom pruning
+        for (i, bloom_filter) in entry.blooms.iter().enumerate() {
+            if bloom_filter.might_contain_json_query(jf) {
+                candidate_set[i] = true;
+            } else {
+                skipped += 1;
+            }
+        }
+    } else if let Some(lit) = literals.as_deref() {
         for (i, bloom_filter) in entry.blooms.iter().enumerate() {
             if bloom_filter.might_contain_query(lit, args.ignore_case) {
                 candidate_set[i] = true;
@@ -314,7 +329,12 @@ pub fn consolidated_search(
                 };
 
                 let line = String::from_utf8_lossy(&block_data[pos..line_end_trim]);
-                if matcher.find_in_line(&line).is_some() {
+                let matched = if let Some(jf) = json_filters.as_ref() {
+                    crate::query::line_matches_filters(&line, jf)
+                } else {
+                    matcher.find_in_line(&line).is_some()
+                };
+                if matched {
                     count += 1;
                     if count >= max_count || args.quiet {
                         break;
@@ -390,7 +410,16 @@ pub fn consolidated_search(
 
             if candidate_set[block_idx] {
                 let line_str = String::from_utf8_lossy(&block_data[pos..line_end_trim]);
-                if let Some((start, end)) = matcher.find_in_line(&line_str) {
+                let match_result = if let Some(jf) = json_filters.as_ref() {
+                    if crate::query::line_matches_filters(&line_str, jf) {
+                        Some((0, line_str.len()))
+                    } else {
+                        None
+                    }
+                } else {
+                    matcher.find_in_line(&line_str)
+                };
+                if let Some((start, end)) = match_result {
                     if matches.len() >= max_count {
                         break;
                     }
@@ -548,6 +577,7 @@ pub fn cached_search(
     matcher: &Matcher,
     args: &Args,
     literals: &Option<Vec<u8>>,
+    json_filters: &Option<Vec<JsonFilter>>,
 ) -> Result<(SearchResult, BlockSearchStats)> {
     let source = &file.path;
     let cache_dir = cache_dir_for(source);
@@ -575,7 +605,15 @@ pub fn cached_search(
     let mut candidate_set = vec![false; block_count];
     let mut skipped = 0usize;
 
-    if let Some(lit) = literals.as_deref() {
+    if let Some(jf) = json_filters.as_ref() {
+        for (i, bloom_filter) in blooms.iter().enumerate() {
+            if bloom_filter.might_contain_json_query(jf) {
+                candidate_set[i] = true;
+            } else {
+                skipped += 1;
+            }
+        }
+    } else if let Some(lit) = literals.as_deref() {
         for (i, bloom_filter) in blooms.iter().enumerate() {
             if bloom_filter.might_contain_query(lit, args.ignore_case) {
                 candidate_set[i] = true;
@@ -612,7 +650,12 @@ pub fn cached_search(
                     line_end
                 };
                 let line = String::from_utf8_lossy(&block_data[pos..line_end_trim]);
-                if matcher.find_in_line(&line).is_some() {
+                let matched = if let Some(jf) = json_filters.as_ref() {
+                    crate::query::line_matches_filters(&line, jf)
+                } else {
+                    matcher.find_in_line(&line).is_some()
+                };
+                if matched {
                     count += 1;
                     if count >= max_count || args.quiet {
                         break;

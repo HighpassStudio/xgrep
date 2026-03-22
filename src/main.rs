@@ -5,6 +5,7 @@ mod discover;
 mod index;
 mod matcher;
 mod output;
+mod query;
 mod search;
 
 use anyhow::Result;
@@ -22,13 +23,39 @@ fn main() -> Result<()> {
 
     // --build-index: create consolidated sidecar cache per directory
     if args.build_index {
-        index::build_consolidated_index(&files)?;
+        index::build_consolidated_index(&files, args.json)?;
         return Ok(());
     }
 
+    // Parse JSON filters if -j mode
+    let json_filters = if args.json {
+        match query::parse_json_query(&args.pattern) {
+            Ok(filters) => Some(filters),
+            Err(e) => {
+                eprintln!("xgrep: invalid JSON filter: {}", e);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
     let matcher = matcher::build(&args)?;
     let writer = output::Writer::new(&args);
-    let literals = bloom::extract_literals(&args.pattern, args.fixed_strings);
+
+    // For JSON mode, extract the most selective value as literal for SIMD precheck
+    let literals = if args.json {
+        json_filters.as_ref().and_then(|filters| {
+            filters
+                .iter()
+                .map(|f| &f.value)
+                .filter(|v| v.len() >= 3)
+                .max_by_key(|v| v.len())
+                .map(|v| v.as_bytes().to_vec())
+        })
+    } else {
+        bloom::extract_literals(&args.pattern, args.fixed_strings)
+    };
 
     // Check for consolidated index in each source directory
     let mut dirs_with_index: std::collections::HashSet<std::path::PathBuf> =
@@ -63,19 +90,19 @@ fn main() -> Result<()> {
 
             // Path 1: consolidated index (single mmap, 2 file opens total)
             if let Some(idx) = consolidated_indexes.get(&dir) {
-                return index::consolidated_search(idx, file, &matcher, &args, &literals);
+                return index::consolidated_search(idx, file, &matcher, &args, &literals, &json_filters);
             }
 
             // Path 2: per-file cached index
             if index::has_cached_index(file) {
-                return index::cached_search(file, &matcher, &args, &literals)
+                return index::cached_search(file, &matcher, &args, &literals, &json_filters)
                     .ok()
                     .filter(|(r, _)| !r.matches.is_empty());
             }
 
             // Path 3: SIMD block-skip (no cache)
-            if literals.is_some() {
-                return block::block_search_file(file, &matcher, &args, &literals)
+            if literals.is_some() || json_filters.is_some() {
+                return block::block_search_file(file, &matcher, &args, &literals, &json_filters)
                     .ok()
                     .filter(|(r, _)| !r.matches.is_empty());
             }

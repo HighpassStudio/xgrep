@@ -1,6 +1,8 @@
 /target
 /bench_10g
 /bench_dir
+/real_logs
 *.log
 *.log.gz
 .xgrep/
+.claude/

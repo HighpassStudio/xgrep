@@ -16,6 +16,7 @@ use crate::bloom;
 use crate::cli::Args;
 use crate::discover::{FileEntry, FileFormat};
 use crate::matcher::{Match, Matcher};
+use crate::query::JsonFilter;
 use crate::search::SearchResult;
 use anyhow::Result;
 use flate2::read::GzDecoder;
@@ -37,10 +38,11 @@ pub fn block_search_file(
     matcher: &Matcher,
     args: &Args,
     literals: &Option<Vec<u8>>,
+    json_filters: &Option<Vec<JsonFilter>>,
 ) -> Result<(SearchResult, BlockSearchStats)> {
     match file.format {
-        FileFormat::PlainText => block_search_plain(file, matcher, args, literals),
-        FileFormat::Gzip => block_search_gzip(file, matcher, args, literals),
+        FileFormat::PlainText => block_search_plain(file, matcher, args, literals, json_filters),
+        FileFormat::Gzip => block_search_gzip(file, matcher, args, literals, json_filters),
     }
 }
 
@@ -49,10 +51,11 @@ fn block_search_plain(
     matcher: &Matcher,
     args: &Args,
     literals: &Option<Vec<u8>>,
+    json_filters: &Option<Vec<JsonFilter>>,
 ) -> Result<(SearchResult, BlockSearchStats)> {
     let data = std::fs::read(&file.path)?;
     let path_str = file.path.to_string_lossy().to_string();
-    block_search_bytes(&data, &path_str, matcher, args, literals)
+    block_search_bytes(&data, &path_str, matcher, args, literals, json_filters)
 }
 
 fn block_search_gzip(
@@ -60,13 +63,14 @@ fn block_search_gzip(
     matcher: &Matcher,
     args: &Args,
     literals: &Option<Vec<u8>>,
+    json_filters: &Option<Vec<JsonFilter>>,
 ) -> Result<(SearchResult, BlockSearchStats)> {
     let f = File::open(&file.path)?;
     let mut decoder = GzDecoder::new(f);
     let mut data = Vec::new();
     decoder.read_to_end(&mut data)?;
     let path_str = file.path.to_string_lossy().to_string();
-    block_search_bytes(&data, &path_str, matcher, args, literals)
+    block_search_bytes(&data, &path_str, matcher, args, literals, json_filters)
 }
 
 /// Core block-skip search using SIMD literal precheck.
@@ -76,6 +80,7 @@ fn block_search_bytes(
     matcher: &Matcher,
     args: &Args,
     literals: &Option<Vec<u8>>,
+    json_filters: &Option<Vec<JsonFilter>>,
 ) -> Result<(SearchResult, BlockSearchStats)> {
     let num_blocks = (data.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
     let mut skipped = 0usize;
@@ -83,8 +88,11 @@ fn block_search_bytes(
     // Phase 1: SIMD literal precheck per block — zero build cost
     let mut candidate_set = vec![true; num_blocks];
 
+    // JSON mode is always case-insensitive (values are lowercased at query parse time)
+    let case_insensitive = args.ignore_case || json_filters.is_some();
+
     if let Some(lit) = literals.as_deref() {
-        let needle = if args.ignore_case {
+        let needle = if case_insensitive {
             lit.to_ascii_lowercase()
         } else {
             lit.to_vec()
@@ -96,9 +104,7 @@ fn block_search_bytes(
             let end = std::cmp::min(start + BLOCK_SIZE, data.len());
             let block_data = &data[start..end];
 
-            let haystack = if args.ignore_case {
-                // For case-insensitive, we need to lowercase the block
-                // This is more expensive but still cheaper than bloom build
+            let haystack = if case_insensitive {
                 let lower: Vec<u8> = block_data.iter().map(|b| b.to_ascii_lowercase()).collect();
                 finder.find(&lower).is_some()
             } else {
@@ -136,7 +142,12 @@ fn block_search_bytes(
                     line_end
                 };
                 let line = String::from_utf8_lossy(&data[pos..line_end_trim]);
-                if matcher.find_in_line(&line).is_some() {
+                let matched = if let Some(jf) = json_filters.as_ref() {
+                    crate::query::line_matches_filters(&line, jf)
+                } else {
+                    matcher.find_in_line(&line).is_some()
+                };
+                if matched {
                     count += 1;
                     if count >= max_count || args.quiet {
                         break;
@@ -196,7 +207,16 @@ fn block_search_bytes(
         if in_candidate {
             let line_str = String::from_utf8_lossy(&data[pos..line_end_trim]);
 
-            if let Some((start, end)) = matcher.find_in_line(&line_str) {
+            let match_result = if let Some(jf) = json_filters.as_ref() {
+                if crate::query::line_matches_filters(&line_str, jf) {
+                    Some((0, line_str.len()))
+                } else {
+                    None
+                }
+            } else {
+                matcher.find_in_line(&line_str)
+            };
+            if let Some((start, end)) = match_result {
                 if needs_context {
                     for ctx in before_buf.drain(..) {
                         context_lines.push(ctx);

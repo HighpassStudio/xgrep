@@ -73,6 +73,12 @@ pub struct Args {
     #[arg(short = 'm', long)]
     pub max_count: Option<usize>,
 
+    /// JSON field filter mode (NDJSON/JSONL).
+    /// Pattern is parsed as field=value clauses instead of text/regex.
+    /// Example: -j 'user_id=12345 status=500'
+    #[arg(short = 'j', long = "json")]
+    pub json: bool,
+
     /// Disable color output
     #[arg(long)]
     pub no_color: bool,
