@@ -1,36 +1,38 @@
 # xgrep
 
-Indexed search for compressed logs. 100-1,200x faster than zgrep on repeated queries.
+Search compressed logs **100x-1,200x faster** than zgrep.
+
+xgrep builds an index once, then only reads the blocks that might match your query.
+
+## Install
 
 ```bash
 cargo install xgrep-cli
 ```
 
+## Usage
+
 ```bash
-xgrep --build-index logs/*.gz          # one-time: build index
-xgrep "user_id=12345" logs/*.gz        # 25ms instead of 30s
+# One-time: build index (~2 min for ~1-2GB compressed)
+xgrep --build-index logs/*.gz
+
+# Every query after that
+zgrep "ERROR" logs/*.gz                # 30s
+xgrep "ERROR" logs/*.gz                # 25ms
 ```
 
-| Dataset | Query | xgrep | zgrep | Speedup |
-|---|---|---|---|---|
-| HDFS (7.5GB) | Block ID | 30ms | 27s | **913x** |
-| HDFS (7.5GB) | `INFO` (broad) | 23ms | 28s | **1,217x** |
-| BGL (5.0GB) | Node ID | 26ms | 17s | **655x** |
-| Spark (2.8GB) | `ERROR` | 2.7s | 10m | **220x** |
+## Benchmarks (real production logs)
 
-Benchmarked on real production logs from [LogHub](https://github.com/logpai/loghub). Cached repeated-query results. [Full benchmark methodology](ARCHITECTURE.md).
+Tested on datasets from [LogHub](https://github.com/logpai/loghub). Results are cached repeated queries. [Full methodology](ARCHITECTURE.md).
 
-## How it works
+| Dataset | Size (decompressed) | Query | xgrep | zgrep | Speedup |
+|---|---|---|---|---|---|
+| HDFS | 7.5GB | Block ID | 30ms | 27s | **913x** |
+| HDFS | 7.5GB | `INFO` | 23ms | 28s | **1,217x** |
+| BGL | 5.0GB | Node ID | 26ms | 17s | **655x** |
+| Spark | 2.8GB | `ERROR` | 2.7s | 10m | **220x** |
 
-Instead of decompressing and scanning everything on every query, xgrep:
-
-1. **Indexes once** — decompresses `.gz` files, splits into 64KB blocks, builds a bloom filter per block
-2. **Searches candidates only** — checks bloom filters (nanoseconds), memory-maps the cache, OS pages in only matching blocks (~1% of data)
-3. **Outputs grep-compatibly** — same flags: `-n`, `-c`, `-l`, `-i`, `-F`, `-A/-B/-C`, color
-
-**Key metric: bytes touched per query is ~0.1-1% of corpus vs 100% for zgrep.** The cost scales with candidate data, not corpus size.
-
-## First query vs repeated query
+### First query vs repeated query
 
 | Mode | Time | Notes |
 |---|---|---|
@@ -38,6 +40,18 @@ Instead of decompressing and scanning everything on every query, xgrep:
 | First query (no cache) | 2.4s | Parallel decompress + scan. 18x faster than zgrep. |
 | Repeated query (cached) | 11-30ms | Bloom skip + mmap. |
 | zgrep | 44s | Full decompress + scan. Every time. |
+
+## Why it's fast
+
+- **zgrep**: decompresses and scans 100% of data every time
+- **xgrep**: reads 0.1-1% of data using block-level bloom filters
+
+## Tradeoffs
+
+- First run builds an index (cached for reuse)
+- Cache stores decompressed data (~5x compressed size)
+- Optimized for repeated searches over compressed logs
+- For one-off plain text search: use ripgrep
 
 ## JSON mode (`-j`)
 
@@ -52,29 +66,19 @@ xgrep -j 'level=error status=500' logs/*.json.gz
 | `user_id=42042` (9 matches) | 40.5s | 0.13s | **319x** |
 | `status=503` (111K matches) | 40.5s | 1.97s | **20x** |
 
-## Usage
+## All flags
 
 ```bash
-# Build index
-xgrep --build-index logs/*.gz
-
-# Search (uses cache automatically)
-xgrep "ERROR" logs/*.gz
+xgrep "ERROR" logs/*.gz                # regex search
 xgrep -F "user_id=12345" logs/*.gz     # fixed string
 xgrep -i "timeout" logs/*.gz           # case insensitive
 xgrep -n -C 3 "Exception" logs/*.gz    # line numbers + context
 xgrep -c "WARN" logs/*.gz              # count only
 xgrep -l "FATAL" logs/*.gz             # filenames only
 xgrep --stats "ERROR" logs/            # show skip statistics
-
-# JSON field search
-xgrep -j 'level=error' logs/*.jsonl.gz
-
-# Plain text (no index needed — parallel SIMD search)
-xgrep "TODO" src/**/*.rs
+xgrep -j 'level=error' logs/*.jsonl.gz # JSON field search
+xgrep "TODO" src/**/*.rs               # plain text (no index needed)
 ```
-
-### Flags
 
 | Flag | Description |
 |---|---|
@@ -93,13 +97,6 @@ xgrep "TODO" src/**/*.rs
 | `--stats` | Show block skip stats |
 | `--include` | Glob filter |
 
-## Tradeoffs
-
-- **Cache size**: ~5x compressed size (stores decompressed data + bloom index)
-- **First run**: ~2 min index build for ~1-2GB compressed (amortized over all subsequent queries)
-- **Not universal grep**: built for repeated search over compressed log archives
-- For one-off plain text search: use ripgrep
-
 ## Who this is for
 
 Engineers who repeatedly search compressed log archives: incident investigation, log forensics, debugging. Anyone who has waited on `zgrep` and wished it were faster — without needing Elasticsearch.
@@ -117,7 +114,7 @@ logs/
 
 - **Bloom filters**: 4KB per 64KB block, token-level, ~3% false positive rate
 - **Staleness**: File size + mtime checked every query. Stale cache ignored automatically.
-- **Deep dive**: [ARCHITECTURE.md](ARCHITECTURE.md) — full architecture, bloom design, benchmark methodology
+- **Deep dive**: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ## License
 
