@@ -2,37 +2,72 @@
 
 How xgrep searches compressed logs 100-1,200x faster than zgrep by reading less than 1% of the data.
 
-## The problem
+## What xgrep is
 
-Every time you run `zgrep` on compressed logs, it decompresses the entire file and scans every byte. On a 7.5GB corpus, that takes 28 seconds. On the tenth query of an incident investigation, it takes 28 seconds again. The hundredth query: still 28 seconds.
+xgrep is an indexed search accelerator for compressed log files. It builds a one-time sidecar index alongside your `.gz` files, then uses bloom filters and memory-mapped I/O to touch only the blocks that might contain your search term. Everything else stays on disk.
 
-The data doesn't change between queries. The decompression work is identical. The scan touches the same bytes. Every query pays full price.
+**When it wins:** Repeated searches over the same compressed log corpus — incident investigation, debugging sessions, log forensics. The index build is a one-time cost; every subsequent query benefits.
 
-xgrep fixes this by building a one-time index that tells it which parts of the data *might* contain your search term — and skipping everything else.
+**What "cached" means:** All benchmark results labeled "cached" or "repeated query" assume the index has already been built via `xgrep --build-index`. First-query performance (no cache) is reported separately. This is not a limitation — it is the design. Engineers investigating an incident run dozens of queries against the same logs. The first query pays the index cost; the rest are near-instant.
+
+**Known limitation:** Lines spanning a 64KB block boundary are attributed to the block where they start. This is conservative (no false negatives) and affects less than 0.1% of lines in practice.
+
+## Benchmark summary
+
+Full methodology is in the [Benchmark methodology](#benchmark-methodology) section below. All datasets are from [LogHub](https://github.com/logpai/loghub) — real production logs.
+
+| Dataset | Files | Compressed | Decompressed | Query | xgrep (cached) | zgrep | Speedup |
+|---|---|---|---|---|---|---|---|
+| HDFS | 76 | 743MB | 7.5GB | Specific block ID | 30ms | 27.4s | **913x** |
+| HDFS | 76 | 743MB | 7.5GB | `INFO` (broad) | 23ms | 28.0s | **1,217x** |
+| BGL | 50 | 421MB | 5.0GB | Specific node | 26ms | 17.4s | **655x** |
+| BGL | 50 | 421MB | 5.0GB | `FATAL` (rare) | 25ms | 17.4s | **708x** |
+| Spark | 3,852 | 189MB | 2.8GB | `Executor` | 5.1s | 10m 2s | **118x** |
+| Spark | 3,852 | 189MB | 2.8GB | `ERROR` | 2.7s | ~10m | **220x** |
+
+Key metric: **bytes touched per query is ~0.1-1% of corpus vs 100% for zgrep.**
+
+### First query vs repeated query
+
+| Mode | Time | Notes |
+|---|---|---|
+| `xgrep --build-index` | ~2 min | One-time. Decompresses, builds blooms, writes cache. |
+| xgrep first query (no cache) | 2.4s | Parallel decompress + scan. Already 18x faster than zgrep. |
+| xgrep repeated query (cached) | 11-30ms | Bloom skip + mmap. Only candidate blocks paged in. |
+| zgrep | 44s | Full decompress + scan. Every time. |
+
+## Why not just use...
+
+| Tool | What it does | Why xgrep is different |
+|---|---|---|
+| **zgrep** | Decompresses entire file, scans every byte, every query | xgrep caches decompressed data + bloom index, touches only candidate blocks |
+| **ripgrep** | Fast text search, no compressed file support | xgrep handles `.gz` natively and adds block-level skip via bloom filters |
+| **jq** | JSON processor, evaluates every line | xgrep's JSON mode (`-j`) skips blocks using bloom-indexed field-value pairs |
+| **Elasticsearch / Splunk** | Full log platforms with ingest pipelines | xgrep is a single binary with no infrastructure — `cargo install` and search |
 
 ## Architecture overview
 
 ```
                     Traditional (zgrep)
                     ==================
-                    decompress ALL → scan ALL → output matches
+                    decompress ALL -> scan ALL -> output matches
                     Cost: O(corpus) per query
 
                     xgrep (cached)
                     ==============
     query
-      ↓
+      |
     check bloom filters (nanoseconds per block)
-      ↓
+      |
     identify candidate blocks (~1% of total)
-      ↓
+      |
     mmap: OS pages in only those blocks
-      ↓
+      |
     match + output
     Cost: O(candidates) per query
 ```
 
-The key insight: **xgrep's cost scales with the number of matching blocks, not the corpus size.** A 7.5GB corpus with a selective query touches ~75MB. A 75GB corpus with the same query still touches ~75MB.
+The key insight: **xgrep's cost scales with the number of candidate blocks, not the corpus size.** A 7.5GB corpus with a selective query touches ~75MB. A 75GB corpus with the same query still touches ~75MB.
 
 ## Index structure
 
@@ -49,11 +84,11 @@ When you run `xgrep --build-index logs/*.gz`, xgrep:
 
 ```
 logs/
-  app-001.log.gz     (compressed source — untouched)
+  app-001.log.gz     (compressed source -- untouched)
   app-002.log.gz
   .xgrep/
-    index.xgi        (bloom filters — ~6% of decompressed size)
-    index.xgd        (decompressed content — memory-mapped)
+    index.xgi        (bloom filters -- ~6% of decompressed size)
+    index.xgd        (decompressed content -- memory-mapped)
 ```
 
 ### Consolidated index format
@@ -88,7 +123,7 @@ Every query checks the source file's size and mtime against the cached values. I
 
 ### Why bloom filters
 
-A bloom filter is a compact probabilistic data structure that can tell you "this term is definitely NOT in this block" or "this term MIGHT be in this block." The first case lets us skip the block entirely. The second case means we search it (with a small false positive rate).
+A bloom filter is a compact probabilistic data structure that can tell you "this term is definitely NOT in this block" or "this term MIGHT be in this block." The first case lets xgrep skip the block entirely. The second case means it searches the block (with a small false positive rate).
 
 ### Token-level indexing
 
@@ -157,32 +192,32 @@ For `-c` (count), `-l` (list files), and `-q` (quiet) modes, xgrep skips line st
 
 ## Query pipeline
 
-### For each query, xgrep follows this pipeline:
+For each query, xgrep follows this pipeline:
 
 ```
 1. Parse pattern
-   ├── Fixed string (-F): extract literal bytes
-   ├── Regex: extract longest required literal substring
-   └── JSON (-j): parse field=value clauses
+   +-- Fixed string (-F): extract literal bytes
+   +-- Regex: extract longest required literal substring
+   +-- JSON (-j): parse field=value clauses
 
 2. Check for cached index
-   ├── Consolidated index exists? → use it (2 file opens)
-   ├── Per-file index exists? → use it
-   └── No cache → fall back to direct search
+   +-- Consolidated index exists? -> use it (2 file opens)
+   +-- Per-file index exists? -> use it
+   +-- No cache -> fall back to direct search
 
 3. Bloom prefilter (if cache exists)
    For each block's bloom filter:
-   ├── Query tokens present? → candidate (search this block)
-   └── Any token absent? → skip (definitely no match)
+   +-- Query tokens present? -> candidate (search this block)
+   +-- Any token absent? -> skip (definitely no match)
 
-4. Search candidate blocks
-   ├── mmap: access only candidate block byte ranges
-   ├── Line splitting via memchr SIMD
-   ├── Match via memchr (fixed string) or regex crate
-   └── Early exit for -q, -m modes
+4. Search only candidate blocks
+   +-- mmap: access only candidate block byte ranges
+   +-- Line splitting via memchr SIMD
+   +-- Match via memchr (fixed string) or regex crate
+   +-- Early exit for -q, -m modes
 
 5. Output
-   └── Grep-compatible formatting with optional color
+   +-- Grep-compatible formatting with optional color
 ```
 
 ### Literal extraction for regex
@@ -263,7 +298,7 @@ Benchmarks were run on a single Windows 11 workstation. Results will vary by dis
 
 ### HDFS — 76 files, 743MB gz, 7.5GB decompressed
 
-| Query | Selectivity | xgrep | zgrep | Speedup |
+| Query | Selectivity | xgrep (cached) | zgrep | Speedup |
 |---|---|---|---|---|
 | `blk_-1608999687919862906` | Specific block ID | 30ms | 27.4s | 913x |
 | `WARN` | ~3% of lines | 28ms | 25.4s | 907x |
@@ -271,7 +306,7 @@ Benchmarks were run on a single Windows 11 workstation. Results will vary by dis
 
 ### BGL — 50 files, 421MB gz, 5.0GB decompressed
 
-| Query | Selectivity | xgrep | zgrep | Speedup |
+| Query | Selectivity | xgrep (cached) | zgrep | Speedup |
 |---|---|---|---|---|
 | `R02-M1-N0` | Specific node | 26ms | 17.4s | 655x |
 | `FATAL` | Rare | 25ms | 17.4s | 708x |
@@ -279,7 +314,7 @@ Benchmarks were run on a single Windows 11 workstation. Results will vary by dis
 
 ### Spark — 3,852 files, 189MB gz, 2.8GB decompressed
 
-| Query | Selectivity | xgrep | zgrep | Speedup |
+| Query | Selectivity | xgrep (cached) | zgrep | Speedup |
 |---|---|---|---|---|
 | `Executor` | Medium | 5.1s | 10m 2s | 118x |
 | `ERROR` | Broad | 2.7s | ~10m | 220x |
