@@ -1,0 +1,6 @@
+/target
+/bench_10g
+/bench_dir
+*.log
+*.log.gz
+.xgrep/

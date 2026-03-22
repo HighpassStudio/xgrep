@@ -1,0 +1,28 @@
+[package]
+name = "xgrep"
+version = "0.1.0"
+edition = "2021"
+description = "Fast grep for compressed and archived data. Parallel search across .gz, .log, and text files."
+license = "Apache-2.0"
+keywords = ["grep", "search", "compression", "parallel", "logs"]
+categories = ["command-line-utilities", "compression"]
+
+[[bin]]
+name = "xgrep"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+memchr = "2"
+regex = "1"
+flate2 = "1"
+anyhow = "1"
+termcolor = "1"
+walkdir = "2"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
