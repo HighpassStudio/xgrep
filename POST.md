@@ -1,21 +1,27 @@
 # Your logs are still a text file
 
-Every incident investigation starts the same way. Something is broken. You have compressed logs. You run zgrep.
+Every incident investigation starts the same way:
 
 ```
 zgrep "user_id=51013" logs/*.gz
 ```
 
-And you wait. 30 seconds. A minute. You refine the query, run it again. Another minute. You try a different field, a different time range. Each query costs the same: full decompression, full scan, every byte, every time.
+...and you wait.
 
-After ten queries you've spent ten minutes waiting for the same data to be decompressed and scanned ten times. The files haven't changed. The decompression work is identical. But zgrep doesn't know that.
+30 seconds. A minute.
+
+You tweak the query. Run it again. Another minute.
+
+Same files. Same decompression. Same full scan.
+
+After ten queries, you've spent ten minutes re-reading the same data.
 
 ## What if grep could remember?
 
-I built xgrep to solve this. It works like this:
+I built xgrep for that.
 
 ```bash
-# One-time: build an index (~2 min for 1.7GB compressed)
+# One-time: build index (~2 min for 1.7GB)
 xgrep --build-index logs/*.gz
 
 # Every query after that
@@ -24,71 +30,102 @@ xgrep "ERROR" logs/*.gz            # 25ms
 xgrep "timeout.*conn" logs/*.gz    # 25ms
 ```
 
-The first time, xgrep decompresses your logs, splits them into 64KB blocks, and builds a compact bloom filter for each block. On every subsequent query, it checks those filters to figure out which blocks *might* contain your search term — and only reads those blocks. The rest never leave disk.
+Instead of decompressing everything every time, xgrep:
 
-On real production logs, this means touching about **1% of the data instead of 100%**.
+- splits logs into 64KB blocks
+- builds a bloom filter per block
+- only reads blocks that might match
 
-## The numbers
+Everything else is skipped.
 
-I tested on three real-world datasets from [LogHub](https://github.com/logpai/loghub) — actual production logs from Hadoop, a Blue Gene/L supercomputer, and Spark.
+**The result: read 1% of the data instead of 100%.**
 
-### HDFS (Hadoop) — 76 files, 743MB compressed, 7.5GB decompressed
+That's the whole idea.
+
+## Benchmarks on real production logs
+
+Datasets from [LogHub](https://github.com/logpai/loghub): Hadoop (HDFS), Blue Gene/L (BGL), and Spark.
+
+### HDFS — 7.5GB decompressed
 
 | Query | xgrep | zgrep | Speedup |
 |---|---|---|---|
-| Specific block ID | 30ms | 27s | **913x** |
+| Block ID | 30ms | 27s | **913x** |
 | `WARN` | 28ms | 25s | **907x** |
-| `INFO` (appears in almost every line) | 23ms | 28s | **1,217x** |
+| `INFO` (very common) | 23ms | 28s | **1,217x** |
 
-### BGL (Supercomputer) — 50 files, 421MB compressed, 5.0GB decompressed
+### BGL — 5.0GB decompressed
 
 | Query | xgrep | zgrep | Speedup |
 |---|---|---|---|
-| Specific node ID | 26ms | 17s | **655x** |
+| Node ID | 26ms | 17s | **655x** |
 | `FATAL` | 25ms | 17s | **708x** |
 
-### Spark — 3,852 files, 189MB compressed
+### Spark — 3,852 files
 
 | Query | xgrep | zgrep | Speedup |
 |---|---|---|---|
-| `Executor` | 5s | 10 min | **118x** |
-| `ERROR` | 2.7s | 10 min | **220x** |
+| `Executor` | 5s | 10m | **118x** |
+| `ERROR` | 2.7s | 10m | **220x** |
 
-These are cached, repeated-query numbers. The first query without a cache is still 18x faster than zgrep (parallel decompression), but the real value is the second query and beyond — which is exactly what incident investigation looks like.
+These are repeated-query (cached) results.
+
+First query is still ~18x faster than zgrep (parallel decompression), but the real win is every query after that — which is how incident debugging actually works.
+
+## JSON logs (jq)
+
+```bash
+zcat logs.json.gz | jq 'select(.user_id == 42042)'   # 40s
+xgrep -j 'user_id=42042' logs.json.gz               # 0.22s
+```
+
+- 188x faster
+- 97% block skip
+- exact results (no misses)
+
+Even broad queries (no skipping) are ~20x faster because xgrep avoids jq's full JSON evaluation.
 
 ## How it works (short version)
 
-1. **Build index**: decompress each `.gz`, divide into 64KB blocks, build a 4KB bloom filter per block that records which tokens appear in that block. Write everything to a sidecar `.xgrep/` directory.
+1. **Index**: decompress once, split into blocks, build bloom filters
+2. **Query**: check filters, read only candidate blocks
+3. **Execution**: memory-mapped, OS loads only what's needed
 
-2. **Query**: load the bloom filters (small), check each block's filter against your search terms (nanoseconds per block), memory-map the cached data, and let the OS page in only the candidate blocks. A 7.5GB file where 98% of blocks are skipped means the OS reads ~150MB.
+The key metric isn't speed. It's **bytes touched per query.**
 
-3. **Output**: grep-compatible. Same flags you already know: `-n`, `-c`, `-l`, `-i`, `-F`, `-A/-B/-C`, color.
+- zgrep: 100% every time
+- xgrep: 0.1-1%
 
-The key metric isn't speed — it's **bytes touched per query**. zgrep touches 100% of the corpus every time. xgrep touches 0.1-1%. That's why the ratio gets better as your logs get bigger.
-
-For the full architecture and benchmark methodology: [ARCHITECTURE.md](ARCHITECTURE.md)
+That's why the gap grows with data size.
 
 ## Tradeoffs (honest)
 
-- **Cache size**: the decompressed data is stored alongside the `.gz` files. Roughly 5x the compressed size. This is the cost of avoiding repeated decompression.
-- **First query**: building the index takes ~2 minutes for a 1.7GB corpus. Amortized over dozens of queries during an investigation, this pays for itself immediately.
-- **Not a universal grep replacement**: xgrep is built for searching compressed log archives repeatedly. For one-off searches on plain text, use ripgrep.
+- **Cache size**: ~5x compressed size (stores decompressed data)
+- **First run**: ~2 min index build (amortized quickly)
+- **Not universal grep**: built for compressed logs + repeated search
+- For plain text: use ripgrep.
 
 ## Who this is for
 
 If you've ever:
-- Waited on `zgrep` during an incident
-- Run the same search ten times while narrowing a bug
-- Wished rotated `.gz` logs were searchable without a log platform
-- Wanted Elasticsearch-level speed without Elasticsearch-level infrastructure
+
+- waited on `zgrep` during an incident
+- rerun the same search 10 times
+- dealt with rotated `.gz` logs
+- wanted log-platform speed without log-platform overhead
+
+## Try it
 
 ```bash
-cargo install --path .
-# or
-cargo build --release
+cargo install xgrep-cli
+xgrep "ERROR" logs/*.gz
 ```
 
 [github.com/HighpassStudio/xgrep](https://github.com/HighpassStudio/xgrep)
+
+## Deep dive
+
+Architecture + benchmark methodology: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
 
