@@ -15,8 +15,63 @@ pub enum FileFormat {
     Gzip,
 }
 
+/// Directories pruned by default during recursive walks.
+/// Covers VCS, language ecosystems, common build/cache/vendor patterns,
+/// and xgrep's own cache (so `.xgrep/index.xgi` and `index.xgd` don't
+/// appear in your own search results).
+///
+/// Disable the default list with `--no-ignore`. Add custom names with
+/// repeated `--exclude <DIR>`.
+const DEFAULT_EXCLUDE_DIRS: &[&str] = &[
+    // xgrep's own cache (self-exclude — fixes index files appearing in results)
+    ".xgrep",
+    // VCS
+    ".git",
+    ".svn",
+    ".hg",
+    ".bzr",
+    // Rust
+    "target",
+    // Node / JS / TS
+    "node_modules",
+    ".next",
+    ".nuxt",
+    // Python
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    // C / C++ / CMake (typical out-of-tree build dirs)
+    "build",
+    "cmake-build-debug",
+    "cmake-build-release",
+    // Generic build / dist outputs
+    "dist",
+    "out",
+    // Vendored / third-party trees
+    "3rdparty",
+    "vendor",
+    "third_party",
+    // Editors / IDE
+    ".idea",
+    ".vscode",
+];
+
+/// Returns true if a directory name should be pruned from the walk.
+/// Defaults are applied unless `use_defaults` is false (`--no-ignore`).
+/// `custom_excludes` is the user-provided `--exclude` list (exact name match).
+fn should_skip_dir(name: &str, custom_excludes: &[String], use_defaults: bool) -> bool {
+    if use_defaults && DEFAULT_EXCLUDE_DIRS.contains(&name) {
+        return true;
+    }
+    custom_excludes.iter().any(|e| e == name)
+}
+
 pub fn find_files(args: &Args) -> Result<Vec<FileEntry>> {
     let mut files = Vec::new();
+    let use_defaults = !args.no_ignore;
 
     for input_path in &args.paths {
         let path = Path::new(input_path);
@@ -26,11 +81,21 @@ pub fn find_files(args: &Args) -> Result<Vec<FileEntry>> {
                 files.push(entry);
             }
         } else if path.is_dir() {
-            for entry in WalkDir::new(path)
+            // Use filter_entry to PRUNE excluded dirs before descending —
+            // a regular filter would still walk into them and waste IO.
+            let walker = WalkDir::new(path)
                 .follow_links(true)
                 .into_iter()
-                .filter_map(|e| e.ok())
-            {
+                .filter_entry(|e| {
+                    // Never filter the user-supplied root or any non-dir entry.
+                    if e.depth() == 0 || !e.file_type().is_dir() {
+                        return true;
+                    }
+                    let name = e.file_name().to_string_lossy();
+                    !should_skip_dir(&name, &args.exclude, use_defaults)
+                });
+
+            for entry in walker.filter_map(|e| e.ok()) {
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -107,5 +172,47 @@ fn matches_glob(path: &Path, glob: &str) -> bool {
         name.ends_with(suffix)
     } else {
         name == glob
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_excludes_well_known_dirs() {
+        let custom: Vec<String> = vec![];
+        // Defaults on
+        assert!(should_skip_dir(".git", &custom, true));
+        assert!(should_skip_dir("node_modules", &custom, true));
+        assert!(should_skip_dir("target", &custom, true));
+        assert!(should_skip_dir("__pycache__", &custom, true));
+        assert!(should_skip_dir("3rdparty", &custom, true));
+        // Self-exclude (the bug that motivated this)
+        assert!(should_skip_dir(".xgrep", &custom, true));
+        // Real source dirs not skipped
+        assert!(!should_skip_dir("src", &custom, true));
+        assert!(!should_skip_dir("tests", &custom, true));
+        assert!(!should_skip_dir("xgrep", &custom, true)); // similar name, not skipped
+    }
+
+    #[test]
+    fn test_no_ignore_disables_defaults() {
+        let custom: Vec<String> = vec![];
+        // --no-ignore should let the walker descend into target/, .git/, etc.
+        assert!(!should_skip_dir(".git", &custom, false));
+        assert!(!should_skip_dir("target", &custom, false));
+        assert!(!should_skip_dir(".xgrep", &custom, false));
+    }
+
+    #[test]
+    fn test_custom_excludes_apply_in_both_modes() {
+        let custom = vec!["my_cache".to_string(), "generated".to_string()];
+        // With defaults on: custom additions still match
+        assert!(should_skip_dir("my_cache", &custom, true));
+        assert!(should_skip_dir("generated", &custom, true));
+        // With defaults off: only custom names match
+        assert!(should_skip_dir("my_cache", &custom, false));
+        assert!(!should_skip_dir(".git", &custom, false));
     }
 }

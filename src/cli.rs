@@ -57,6 +57,16 @@ pub struct Args {
     #[arg(long)]
     pub include: Option<String>,
 
+    /// Skip directory by name (repeatable). Adds to the default
+    /// excluded list (.git, target, node_modules, .venv, .xgrep, etc.).
+    #[arg(long = "exclude", value_name = "DIR")]
+    pub exclude: Vec<String>,
+
+    /// Disable the default excluded-directory list. Default-skipped
+    /// dirs (.git, target, node_modules, .xgrep, etc.) are walked again.
+    #[arg(long = "no-ignore")]
+    pub no_ignore: bool,
+
     /// Print only matched parts
     #[arg(short = 'o', long)]
     pub only_matching: bool,
