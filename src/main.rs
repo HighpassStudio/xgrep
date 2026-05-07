@@ -11,7 +11,85 @@ mod search;
 use anyhow::Result;
 use cli::Args;
 use rayon::prelude::*;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+
+/// Search a single file across all four code paths, converting both errors and
+/// panics into a logged warning + `None` so one bad file (locked by another
+/// process, partially written, mid-rotation, etc.) can't abort the whole
+/// search. Fixes v0.1.0 PermissionDenied panic on actively-written trees.
+fn try_search_file(
+    file: &discover::FileEntry,
+    consolidated_indexes: &std::collections::HashMap<std::path::PathBuf, index::ConsolidatedIndex>,
+    matcher: &matcher::Matcher,
+    args: &Args,
+    literals: &Option<Vec<u8>>,
+    json_filters: &Option<Vec<query::JsonFilter>>,
+) -> Option<(search::SearchResult, block::BlockSearchStats)> {
+    let path_display = file.path.display().to_string();
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let dir = file
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+
+        // Path 1: consolidated index (single mmap, 2 file opens total)
+        if let Some(idx) = consolidated_indexes.get(&dir) {
+            return index::consolidated_search(idx, file, matcher, args, literals, json_filters);
+        }
+
+        // Path 2: per-file cached index
+        if index::has_cached_index(file) {
+            return match index::cached_search(file, matcher, args, literals, json_filters) {
+                Ok(r) => Some(r).filter(|(r, _)| !r.matches.is_empty()),
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", path_display, e);
+                    None
+                }
+            };
+        }
+
+        // Path 3: SIMD block-skip (no cache)
+        if literals.is_some() || json_filters.is_some() {
+            return match block::block_search_file(file, matcher, args, literals, json_filters) {
+                Ok(r) => Some(r).filter(|(r, _)| !r.matches.is_empty()),
+                Err(e) => {
+                    eprintln!("xgrep: {}: {}", path_display, e);
+                    None
+                }
+            };
+        }
+
+        // Path 4: fallback line-by-line
+        match search::search_file(file, matcher, args) {
+            Ok(r) if !r.matches.is_empty() => Some((
+                r,
+                block::BlockSearchStats {
+                    total_blocks: 0,
+                    skipped_blocks: 0,
+                    searched_blocks: 0,
+                },
+            )),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("xgrep: {}: {}", path_display, e);
+                None
+            }
+        }
+    }));
+
+    match outcome {
+        Ok(opt) => opt,
+        Err(_) => {
+            // Third-party crate panicked on this file (flate2 on a
+            // truncated gzip, mmap on a vanishing file, etc.). Skip it.
+            eprintln!("xgrep: {}: skipped (internal panic)", path_display);
+            None
+        }
+    }
+}
 
 fn main() -> Result<()> {
     let args = Args::parse_args()?;
@@ -82,45 +160,14 @@ fn main() -> Result<()> {
     let results: Vec<_> = files
         .par_iter()
         .filter_map(|file| {
-            let dir = file
-                .path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .to_path_buf();
-
-            // Path 1: consolidated index (single mmap, 2 file opens total)
-            if let Some(idx) = consolidated_indexes.get(&dir) {
-                return index::consolidated_search(idx, file, &matcher, &args, &literals, &json_filters);
-            }
-
-            // Path 2: per-file cached index
-            if index::has_cached_index(file) {
-                return index::cached_search(file, &matcher, &args, &literals, &json_filters)
-                    .ok()
-                    .filter(|(r, _)| !r.matches.is_empty());
-            }
-
-            // Path 3: SIMD block-skip (no cache)
-            if literals.is_some() || json_filters.is_some() {
-                return block::block_search_file(file, &matcher, &args, &literals, &json_filters)
-                    .ok()
-                    .filter(|(r, _)| !r.matches.is_empty());
-            }
-
-            // Path 4: fallback line-by-line
-            search::search_file(file, &matcher, &args)
-                .ok()
-                .filter(|r| !r.matches.is_empty())
-                .map(|r| {
-                    (
-                        r,
-                        block::BlockSearchStats {
-                            total_blocks: 0,
-                            skipped_blocks: 0,
-                            searched_blocks: 0,
-                        },
-                    )
-                })
+            try_search_file(
+                file,
+                &consolidated_indexes,
+                &matcher,
+                &args,
+                &literals,
+                &json_filters,
+            )
         })
         .collect();
 
