@@ -63,8 +63,15 @@ impl BloomFilter {
     /// Check if ALL tokens from a query string might exist in this block.
     /// Splits the query on delimiters and checks each resulting token.
     /// Returns false (skip block) if any required token is definitely absent.
-    pub fn might_contain_query(&self, query: &[u8], ignore_case: bool) -> bool {
-        let tokens = tokenize(query, ignore_case);
+    ///
+    /// The `_ignore_case` parameter is kept for caller-side documentation
+    /// but is intentionally unused: the bloom builder always inserts
+    /// lowercased tokens, so the query path must always lowercase to match
+    /// (otherwise a case-sensitive query against mixed-case content would
+    /// produce false negatives — see v0.1.1 bloom regression). The
+    /// line-level matcher downstream enforces actual case sensitivity.
+    pub fn might_contain_query(&self, query: &[u8], _ignore_case: bool) -> bool {
+        let tokens = tokenize(query, true);
         if tokens.is_empty() {
             return true; // can't filter
         }
@@ -307,6 +314,38 @@ mod tests {
         assert!(bloom.might_contain_query(b"12345", false));
         assert!(bloom.might_contain_query(b"ERROR", true));
         assert!(bloom.might_contain_query(b"user_id=12345", true));
+    }
+
+    /// Regression test for v0.1.1 bloom false-negative bug.
+    ///
+    /// `build_block_bloom` always lowercases tokens, but pre-fix
+    /// `might_contain_query` only lowercased when `ignore_case=true`.
+    /// A default case-sensitive query for `__vbaStrCmp` against content
+    /// containing the same string would hash `vbaStrCmp` (preserved case)
+    /// vs the inserted `vbastrcmp` (lowercase), produce different bits,
+    /// and skip the block — dropping a real match. Reproduced on the
+    /// WMMA5-modern Ghidra decompile tree (cached search returned ~50%
+    /// of grep's hits).
+    #[test]
+    fn test_bloom_case_sensitive_query_no_false_negative() {
+        let content = b"calling __vbaStrCmp(arg1, arg2) and MultiByteToWideChar()";
+        let bloom = build_block_bloom(content);
+
+        // Case-sensitive query (ignore_case=false) MUST still hit:
+        assert!(
+            bloom.might_contain_query(b"__vbaStrCmp", false),
+            "false negative on mixed-case literal with default search"
+        );
+        assert!(
+            bloom.might_contain_query(b"vbaStrCmp", false),
+            "false negative on mixed-case substring"
+        );
+        assert!(
+            bloom.might_contain_query(b"MultiByteToWideChar", false),
+            "false negative on PascalCase identifier"
+        );
+        // And case-insensitive too (was already passing):
+        assert!(bloom.might_contain_query(b"__VBASTRCMP", true));
     }
 
     #[test]
