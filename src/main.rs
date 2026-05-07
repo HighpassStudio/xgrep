@@ -36,19 +36,35 @@ fn try_search_file(
             .to_path_buf();
 
         // Path 1: consolidated index (single mmap, 2 file opens total)
+        //
+        // Falls through to Path 3/4 if `consolidated_search` returns None,
+        // which happens when the file isn't in the index (added after build)
+        // OR when the staleness check fails (file mtime/size differs from
+        // the values captured at build time). Pre-v0.1.3 returned the None
+        // verbatim, silently dropping such files from results — a real
+        // correctness regression on actively-edited trees and on Windows
+        // where nanosecond mtime jitter makes the exact-equality check
+        // unreliable.
         if let Some(idx) = consolidated_indexes.get(&dir) {
-            return index::consolidated_search(idx, file, matcher, args, literals, json_filters);
+            if let Some(result) =
+                index::consolidated_search(idx, file, matcher, args, literals, json_filters)
+            {
+                return Some(result);
+            }
+            // else: not indexed or stale — fall through to uncached search
         }
 
-        // Path 2: per-file cached index
+        // Path 2: per-file cached index. Falls through on Err only — when
+        // the cached search returns Ok(empty), that's a confirmed "no
+        // matches" answer and we should NOT re-search.
         if index::has_cached_index(file) {
-            return match index::cached_search(file, matcher, args, literals, json_filters) {
-                Ok(r) => Some(r).filter(|(r, _)| !r.matches.is_empty()),
+            match index::cached_search(file, matcher, args, literals, json_filters) {
+                Ok(r) => return Some(r).filter(|(r, _)| !r.matches.is_empty()),
                 Err(e) => {
                     eprintln!("xgrep: {}: {}", path_display, e);
-                    None
+                    // fall through to uncached search
                 }
-            };
+            }
         }
 
         // Path 3: SIMD block-skip (no cache)

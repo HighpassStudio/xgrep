@@ -1,6 +1,6 @@
 [package]
 name = "xgrep-cli"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Indexed search accelerator for compressed logs. Cached queries 100-1200x faster than zgrep."
 license = "Apache-2.0"
