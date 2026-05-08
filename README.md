@@ -43,36 +43,57 @@ Tested on datasets from [LogHub](https://github.com/logpai/loghub). Results are 
 
 ## Why it's fast
 
-- **zgrep**: decompresses and scans 100% of data every time
-- **xgrep**: reads 0.1-1% of data using block-level bloom filters
+- **zgrep**: decompresses and scans 100% of data every time. No skip, no cache.
+- **ripgrep `-z`**: decompresses fully but scans efficiently (SIMD, parallel). No persistent skip cache.
+- **xgrep**: indexes once, then on repeats reads only the blocks that *might* contain the term — typically 0.1–10% of data on selective queries.
 
-## Also faster than grep on plain text
+## vs ripgrep `-z` (the modern baseline)
 
-While compressed-log search is xgrep's moat, the bloom prefilter pays off
-on uncompressed source code too. Six head-to-head queries against GNU grep
-on two real corpora — **xgrep won every one**:
+Ripgrep with `-z` searches `.gz` files directly. xgrep adds a persistent
+bloom-filter index so repeated investigation queries on the same archive
+don't pay decompression cost twice. Honest head-to-head on a 56MB / 10-shard
+synthetic NDJSON.gz corpus (~2.5M lines, ~250MB decompressed):
 
-| Corpus | Files | Query | xgrep | grep | Speedup |
-|---|---|---|---|---|---|
-| RE decompile (`.c`, mixed) | 1,164 | rare hex addr | 52ms | 253ms | **4.87x** |
-| RE decompile (`.c`, mixed) | 1,164 | mid-frequency call | 63ms | 255ms | **4.05x** |
-| RE decompile (`.c`, mixed) | 1,164 | universal token | 221ms | 370ms | **1.67x** |
-| Python project | 25 | rare identifier | 41ms | 57ms | **1.39x** |
-| Python project | 25 | `def ` | 29ms | 51ms | **1.76x** |
-| Python project | 25 | `import` | 29ms | 37ms | **1.28x** |
+| Query | xgrep cached | ripgrep `-z` | Winner |
+|---|---|---|---|
+| Rare needle (1 hit) | 158ms | 320ms | **xgrep 2.0x** |
+| `-j` rare field=value (1 hit) | 228ms | 314ms | **xgrep-j 1.4x** |
+| Selective (~3% of lines) | 436ms | 347ms | rg 1.25x |
+| Common (~70% of lines) | 4,989ms | 600ms | rg 8.3x |
 
-**6/6 wins, 1.28x–4.87x range.** Indexed first, then queried — same
-methodology as the gz numbers above. For maximum source-code search
-throughput consider [ripgrep](https://github.com/BurntSushi/ripgrep)
-(purpose-built for that workload); xgrep is the tool when compressed
-archives are in the mix or you want one binary that handles both.
+**Where xgrep wins:** rare-needle queries — specific request IDs, user
+IDs, error codes, trace IDs. The bloom filter skips 90%+ of blocks, and
+the cached decompressed data is mmap'd for instant access on repeat runs.
+This is the *investigation* pattern — searching the same archive over
+and over for different specific things.
+
+**Where ripgrep wins:** high-frequency patterns (the term is in most
+blocks, so the bloom can't skip much) and one-shot searches where xgrep's
+index-build cost isn't amortized. ripgrep's line scan is purpose-built
+and very fast.
+
+## When to use xgrep
+
+```
+Are you searching compressed archives?
+├─ No  → use ripgrep
+└─ Yes → Will you query the same archive multiple times?
+        ├─ No  → use ripgrep -z (no index build needed)
+        └─ Yes → Are your queries selective (rare terms)?
+                ├─ No  → ripgrep -z is probably fine
+                └─ Yes → use xgrep ✓
+```
+
+xgrep is an investigation tool: incident debugging, log forensics, finding
+the unusual line in 50GB of gzipped logs. For source-code search, daily
+grep workflows, or one-off scans, use ripgrep.
 
 ## Tradeoffs
 
-- First run builds an index (cached for reuse)
-- Cache stores decompressed data (~5x compressed size)
-- Optimized for repeated searches over compressed logs
-- For one-off plain text search: ripgrep is also a great option
+- First run builds an index (~12s for ~50MB compressed; one-time, cached)
+- Cache stores decompressed data (~5x compressed size on disk)
+- Optimized for repeated *selective* searches over compressed logs
+- Index is gz-corpus-shaped — small uncompressed corpora rarely justify it
 
 ## JSON mode (`-j`)
 
@@ -122,7 +143,13 @@ xgrep "TODO" src/**/*.rs               # plain text (no index needed)
 
 ## Who this is for
 
-Engineers who repeatedly search compressed log archives: incident investigation, log forensics, debugging. Anyone who has waited on `zgrep` and wished it were faster — without needing Elasticsearch.
+Engineers running compressed-log investigations: incident debugging, log
+forensics, on-call retros. Anyone who repeatedly searches `.gz` archives
+for rare events and has waited on `zgrep` (or even `rg -z`) — without
+needing Elasticsearch.
+
+Not a general-purpose grep replacement. For source-code search, daily
+greps, or one-shot scans of small files: use [ripgrep](https://github.com/BurntSushi/ripgrep).
 
 ## How the index works
 
