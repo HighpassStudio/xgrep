@@ -60,7 +60,14 @@ pub struct ConsolidatedIndex {
 }
 
 /// Build consolidated index for a set of files in a directory.
-pub fn build_consolidated_index(files: &[FileEntry], json_mode: bool) -> Result<()> {
+///
+/// `_json_mode` is accepted for API compatibility with `xgrep --build-index -j`
+/// but is now ignored: the bloom builder ALWAYS attempts JSON enrichment
+/// (failed `serde_json::from_str` on non-JSON lines is fast and silent).
+/// This fixes the v0.1.4-and-earlier bug where queries like
+/// `xgrep -j 'level=ERROR'` returned ~0.1% of real hits unless the user
+/// happened to know they had to pass `-j` at build time too.
+pub fn build_consolidated_index(files: &[FileEntry], _json_mode: bool) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
@@ -73,13 +80,13 @@ pub fn build_consolidated_index(files: &[FileEntry], json_mode: bool) -> Result<
     }
 
     for (dir, dir_files) in &by_dir {
-        build_index_for_dir(dir, dir_files, json_mode)?;
+        build_index_for_dir(dir, dir_files)?;
     }
 
     Ok(())
 }
 
-fn build_index_for_dir(dir: &Path, files: &[&FileEntry], json_mode: bool) -> Result<()> {
+fn build_index_for_dir(dir: &Path, files: &[&FileEntry]) -> Result<()> {
     let cache_dir = dir.join(".xgrep");
     fs::create_dir_all(&cache_dir)?;
 
@@ -130,15 +137,15 @@ fn build_index_for_dir(dir: &Path, files: &[&FileEntry], json_mode: bool) -> Res
         index_buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
         index_buf.extend_from_slice(&(num_blocks as u32).to_le_bytes());
 
-        // Build and write blooms
+        // Build and write blooms.
+        // Always JSON-enrich: build_block_bloom_json is a strict superset of
+        // build_block_bloom (it adds field=value pairs from any line that
+        // parses as JSON, on top of the standard tokens). Non-JSON content
+        // simply gets the standard token bloom — no incorrect data is added.
         for block_idx in 0..num_blocks {
             let start = block_idx * BLOCK_SIZE;
             let end = std::cmp::min(start + BLOCK_SIZE, data.len());
-            let bloom_filter = if json_mode {
-                bloom::build_block_bloom_json(&data[start..end])
-            } else {
-                bloom::build_block_bloom(&data[start..end])
-            };
+            let bloom_filter = bloom::build_block_bloom_json(&data[start..end]);
             let bits = bloom_filter.as_bytes();
             index_buf.extend_from_slice(bits);
             if bits.len() < BLOOM_SIZE {
